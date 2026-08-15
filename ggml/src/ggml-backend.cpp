@@ -1287,24 +1287,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
-        // find the backend of the first split, skipping view ops
-        int i = 0;
-        for (; i < graph->n_nodes; i++) {
-            struct ggml_tensor * node = graph->nodes[i];
-            if (!ggml_is_view_op(node->op)) {
-                split->backend_id = tensor_backend_id(node);
-                break;
-            }
-        }
+        split->backend_id = tensor_backend_id(graph->nodes[0]);
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
-        for (; i < graph->n_nodes; i++) {
+        for (int i = 0; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-
-            if (ggml_is_view_op(node->op)) {
-                continue;
-            }
 
             const int node_backend_id = tensor_backend_id(node);
 
