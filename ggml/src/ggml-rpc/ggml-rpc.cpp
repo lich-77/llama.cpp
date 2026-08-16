@@ -221,6 +221,10 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    // memoize remote get_alloc_size answers: identical requests always map to
+    // the same size on a given server, and galloc re-asks for every graph rebuild
+    std::mutex alloc_size_mutex;
+    std::unordered_map<uint64_t, std::pair<rpc_msg_get_alloc_size_req, size_t>> alloc_size_cache;
 };
 
 struct ggml_backend_rpc_context {
@@ -643,10 +647,42 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
+        // the server answer does not depend on tensor identity (pointer fields)
+        // or names, so clear them to merge per-layer duplicates into one entry.
+        // src ids must stay nonzero for present srcs: the server uses id != 0
+        // to decide whether a src tensor was sent (cuda reads FA srcs)
+        memset(request.tensor.name, 0, sizeof(request.tensor.name));
+        request.tensor.id        = 0;
+        request.tensor.buffer    = 0;
+        request.tensor.data      = 0;
+        request.tensor.view_src  = 0;
+        request.tensor.view_offs = 0;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            memset(request.srcs[i].name, 0, sizeof(request.srcs[i].name));
+            if (request.srcs[i].id != 0) {
+                request.srcs[i].id = 1;
+            }
+        }
+
+        const uint64_t key = fnv_hash((const uint8_t *) &request, sizeof(request));
+
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
+            auto it = buft_ctx->alloc_size_cache.find(key);
+            if (it != buft_ctx->alloc_size_cache.end() &&
+                memcmp(&it->second.first, &request, sizeof(request)) == 0) {
+                return it->second.second;
+            }
+        }
+
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
+
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
+            buft_ctx->alloc_size_cache[key] = { request, response.alloc_size };
+        }
 
         return response.alloc_size;
     }
@@ -782,13 +818,12 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t alignment = get_alignment(sock, device);
     size_t max_size = get_max_size(sock, device);
-    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
-        /* .endpoint  = */ endpoint,
-        /* .device    = */ device,
-        /* .name      = */ buft_name,
-        /* .alignment = */ alignment,
-        /* .max_size  = */ max_size
-    };
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context();
+    buft_ctx->endpoint  = endpoint;
+    buft_ctx->device    = device;
+    buft_ctx->name      = buft_name;
+    buft_ctx->alignment = alignment;
+    buft_ctx->max_size  = max_size;
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
         /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
