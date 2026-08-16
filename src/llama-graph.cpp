@@ -730,50 +730,6 @@ static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
 }
 
-static void dsv4_set_kq_mask(
-        ggml_tensor * dst,
-        const llama_kv_cache_dsv4_context::comp_plan & plan,
-        uint32_t n_tokens,
-        int64_t n_stream) {
-    if (!dst || !dst->buffer) {
-        return;
-    }
-
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(n_stream > 0);
-    GGML_ASSERT(n_tokens%n_stream == 0);
-    GGML_ASSERT(dst->ne[0] == plan.n_kv);
-    GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens/n_stream);
-    GGML_ASSERT(dst->ne[2] == 1);
-    GGML_ASSERT(dst->ne[3] == n_stream);
-    GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    if (dst->type == GGML_TYPE_F32) {
-        float * data = (float *) dst->data;
-
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i];
-
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
-            }
-        }
-    } else if (dst->type == GGML_TYPE_F16) {
-        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
-        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
-        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
-
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i];
-
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
-            }
-        }
-    }
-}
-
 static ggml_tensor * dsv4_build_raw_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_dsv4_raw_context * mctx,
@@ -842,8 +798,7 @@ static void dsv4_set_comp_inputs(
         const llama_kv_cache_dsv4_context::comp_plan & plan,
         const char * name,
         bool debug,
-        uint32_t n_tokens,
-        int64_t n_stream) {
+        uint32_t n_tokens) {
     dsv4_set_i32(inp.state_pos, plan.state_pos);
     dsv4_set_i32(inp.state_persist_src_idxs, plan.state_persist_src_idxs);
     dsv4_set_i32(inp.state_persist_dst_idxs, plan.state_persist_dst_idxs);
@@ -854,11 +809,11 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
-    dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    dsv4_set_i32(inp.n_visible, plan.n_visible);
 
     if (debug || dsv4_compress_debug()) {
-        LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
-                __func__, name, n_tokens, (int) n_stream,
+        LLAMA_LOG_INFO("%s: %s n_tokens=%u, state_persist_dst=%s, state_write_pos=%s\n",
+                __func__, name, n_tokens,
                 dsv4_plan_positions(plan.state_persist_dst_idxs).c_str(),
                 dsv4_plan_positions(plan.state_write_pos).c_str());
     }
@@ -870,27 +825,24 @@ static bool dsv4_can_reuse_tensor_1d(ggml_tensor * t, int64_t ne0) {
 
 static bool dsv4_can_reuse_kq_mask(
         ggml_tensor * t,
-        const llama_kv_cache_dsv4_context::comp_plan & plan,
-        uint32_t n_tokens,
-        int64_t n_stream) {
+        const llama_kv_cache_dsv4_context::comp_plan & plan) {
     if (plan.n_kv == 0) {
         return t == nullptr;
     }
 
-    GGML_ASSERT(n_stream > 0);
+    // the mask is recomputed in-graph every step from n_visible, so only its
+    // shape (determined by n_kv, the token count and the stream count) needs to match
+    GGML_ASSERT(plan.n_stream > 0);
 
     return t != nullptr &&
            t->ne[0] == plan.n_kv &&
-           t->ne[1] == (int64_t) n_tokens/n_stream &&
-           t->ne[2] == 1 &&
-           t->ne[3] == n_stream;
+           t->ne[1] == (int64_t) plan.n_visible.size()/plan.n_stream &&
+           t->ne[3] == plan.n_stream;
 }
 
 static bool dsv4_can_reuse_comp_input(
         const llm_graph_input_dsv4::comp_input & inp,
-        const llama_kv_cache_dsv4_context::comp_plan & plan,
-        uint32_t n_tokens,
-        int64_t n_stream) {
+        const llama_kv_cache_dsv4_context::comp_plan & plan) {
     bool res = true;
     res &= dsv4_can_reuse_tensor_1d(inp.state_pos, plan.state_pos.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_persist_src_idxs, plan.state_persist_src_idxs.size());
@@ -902,7 +854,8 @@ static bool dsv4_can_reuse_comp_input(
     res &= dsv4_can_reuse_tensor_1d(inp.state_read_idxs, plan.state_read_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_idxs, plan.state_write_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_pos, plan.state_write_pos.size());
-    res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    res &= dsv4_can_reuse_tensor_1d(inp.n_visible, plan.n_visible.size());
+    res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan);
 
     return res;
 }
@@ -941,15 +894,46 @@ static void dsv4_build_comp_inputs(
     inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
     inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
 
+    // the attention mask is built in-graph from the compact per-token visible
+    // counts. uploading the dense [n_kv, n_tokens] mask instead would move
+    // megabytes over the network on every graph in multi-node RPC setups.
+    inp.n_visible = dsv4_build_input_1d(ctx, GGML_TYPE_I32, (int64_t) plan.n_visible.size(), std::string("dsv4_") + name + "_n_visible");
+
     if (plan.n_kv > 0) {
         const int64_t n_tokens = (int64_t) plan.n_visible.size();
 
         GGML_ASSERT(n_stream > 0);
         GGML_ASSERT(n_tokens%n_stream == 0);
 
-        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
-        ggml_set_input(inp.kq_mask);
-        ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+        const bool is_lid = strcmp(name, "lid") == 0;
+        const ggml_type type = (!is_lid && cparams.flash_attn) || (is_lid && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+        ggml_tensor * mask = nullptr;
+        if (n_tokens == 0) {
+            // reserve graph: same shape, empty content
+            mask = ggml_new_tensor_4d(ctx, type, plan.n_kv, 0, 1, n_stream);
+        } else {
+            // mask[j, i] = 0 if j < n_visible[i] else -inf, in linear token order
+            ggml_tensor * arange = ggml_arange(ctx, 0, plan.n_kv, 1); // [n_kv]
+            arange = ggml_reshape_2d(ctx, arange, plan.n_kv, 1);
+
+            ggml_tensor * vis = ggml_cast(ctx, inp.n_visible, GGML_TYPE_F32); // [n_tokens]
+            vis = ggml_reshape_2d(ctx, vis, 1, n_tokens);
+
+            arange = ggml_repeat_4d(ctx, arange, plan.n_kv, n_tokens, 1, 1); // [n_kv, n_tokens]
+            vis    = ggml_repeat_4d(ctx, vis,    plan.n_kv, n_tokens, 1, 1);
+
+            mask = ggml_sub(ctx, arange, vis);
+            mask = ggml_sigmoid(ctx, ggml_scale(ctx, mask, 1e4f));
+            mask = ggml_scale_bias(ctx, mask, -1e38f, 0.0f);
+            mask = ggml_reshape_4d(ctx, mask, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        }
+        if (type == GGML_TYPE_F16) {
+            mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+        }
+        ggml_set_name(mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+
+        inp.kq_mask = mask;
     }
 }
 
@@ -971,14 +955,13 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     const auto & plan_csa = mctx->get_csa_plan(*ubatch);
     const auto & plan_hca = mctx->get_hca_plan(*ubatch);
     const auto & plan_lid = mctx->get_lid_plan(*ubatch);
-    const int64_t n_stream = plan_csa.n_stream;
 
     inp_raw->mctx = mctx->get_raw();
     inp_raw->set_input(ubatch);
 
-    dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
-    dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
-    dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+    dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens);
+    dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens);
+    dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens);
 
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
@@ -1016,9 +999,9 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
     }
 
-    res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
-    res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
-    res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+    res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa);
+    res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca);
+    res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid);
 
     return res;
 }
