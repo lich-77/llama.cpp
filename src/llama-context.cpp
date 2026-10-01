@@ -460,6 +460,17 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (model.moe_lru_slots() > 0) {
+            std::vector<ggml_backend_t> lru_backends;
+            for (const auto & b : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    lru_backends.push_back(b.get());
+                }
+            }
+            lru = model.create_moe_lru(lru_backends);
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -481,6 +492,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (lru) {
+        lru->log_final_stats();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -2448,6 +2463,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res *= 4;
     }
 
+    if (lru) {
+        res += lru->n_pooled() * llama_moe_lru::NODES_PER_LAYER;
+    }
     return res;
 }
 
@@ -2596,6 +2614,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
+        /*.lru         =*/ lru.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-lru.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1507,6 +1508,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
+    std::vector<llama_model_tensor_buft_override> lru_override_storage;
+    if (llama_moe_lru::init_model_overrides(ml, devices, lru_override_storage, params.moe_lru_slots)) {
+        LLAMA_LOG_DEBUG("llama_moe_lru: expert overrides redirected for pinned loading\n");
+    }
+
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
@@ -2915,6 +2921,20 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 // interface implementation
 //
 
+int32_t llama_model::moe_lru_slots() const {
+    return params.moe_lru_slots;
+}
+
+std::unique_ptr<llama_moe_lru> llama_model::create_moe_lru(const std::vector<ggml_backend_t> & gpu_backends) const {
+    try {
+        auto lru = std::make_unique<llama_moe_lru>(*this, gpu_backends, params.moe_lru_slots);
+        return lru;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("llama_moe_lru: %s, running without pools\n", e.what());
+        return nullptr;
+    }
+}
+
 llama_model_params llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
@@ -2925,6 +2945,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.moe_lru_slots               =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

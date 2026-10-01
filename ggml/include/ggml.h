@@ -601,6 +601,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_LRU_DECIDE,
+        GGML_OP_LRU_FILL,
+
         GGML_OP_COUNT,
     };
 
@@ -2614,6 +2617,52 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
+
+    // LRU expert cache, decode path (single token or a small verification
+    // batch such as speculative decoding). n_used below is the router's
+    // top-k (llama-side name: n_expert_used).
+    //
+    // The persistent LRU state is one i32 tensor updated in place (like the
+    // KV cache, it has to survive across graph executions):
+    //   [0, n_expert)                    owner:  expert -> slot, -1 if none
+    //   [n_expert, n_expert + n_slot)    slot owner: slot -> expert, -1 if free
+    //   [n_expert + n_slot, +2*n_slot)   last_use: tick of the last use per slot
+    //   [n_expert + 2*n_slot]            tick: logical clock for last_use,
+    //                                       +1 per decide call
+    //   [n_expert + 2*n_slot + 1]        cumulative ids  (stats)
+    //   [n_expert + 2*n_slot + 2]        cumulative fills (stats)
+    //
+    // ggml_lru_decide: looks up the ids in the LRU state, refreshes recency,
+    // evicts the least recently used slot for every miss. Duplicate experts
+    // within the batch share one slot. The caller must guarantee
+    // n_tokens * n_used <= n_slot so the batch fits.
+    // ids: i32 [n_used, n_tokens]  router top-k expert ids per token
+    // returns one flat i32 tensor, laid out as [slot ids | fill list]:
+    //   [0, n_used*n_tokens)             slot id per input id, valid after fill
+    //   [n_used*n_tokens, +2*n_slot)     fill list: (expert, slot) pairs
+    //   [n_used*n_tokens + 2*n_slot]     fill count this call (the position is
+    //                                     capacity-derived so views of the two
+    //                                     regions keep a fixed shape)
+    GGML_API struct ggml_tensor * ggml_lru_decide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state,
+            int32_t               n_expert,
+            int32_t               n_slot);
+
+    // ggml_lru_fill: copies whole entries named in the fill list from src
+    // (device-readable host memory) into pool slots. src is not stored as a
+    // graph source: a pointer to the tensor is captured in the op params at
+    // build time (the tensor object must outlive the graphs), and the fill
+    // kernel reads it in place. fill_list is the fill-list region of the
+    // decide output (a view), which orders the fill after the decide.
+    // Returns a view of the pool: consuming it as the weights orders the
+    // reader after the fills.
+    GGML_API struct ggml_tensor * ggml_lru_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fill_list,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * pool);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).

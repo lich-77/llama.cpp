@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-moe-lru.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1497,6 +1498,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    lru              (params.lru),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2175,6 +2177,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
+        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots()) {
+        GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
+                    down_exps_b == nullptr && gate_up_exps_b == nullptr &&
+                    up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr);
+        ggml_tensor * out = ggml_lru_decide(ctx0, selected_experts, lru->state_get(il),
+                                            (int32_t) hparams.n_expert, (int32_t) lru->n_slots());
+        ggml_tensor * slot = ggml_view_2d(ctx0, out, n_expert_used, n_tokens,
+                                          n_expert_used * sizeof(int32_t), 0);
+        ggml_build_forward_expand(gf, slot);
+        ggml_tensor * flist = ggml_view_1d(ctx0, out, 2 * lru->n_slots() + 1,
+                                           (int64_t) n_expert_used * n_tokens * sizeof(int32_t));
+        ggml_tensor * upd[llama_moe_lru::N_KIND];
+        for (int fk = 0; fk < 3; fk++) {
+            upd[fk] = ggml_lru_fill(ctx0, flist, lru->exps_get(il, fk), lru->pool_get(il, fk));
+            ggml_build_forward_expand(gf, upd[fk]);
+        }
+        up_exps   = upd[llama_moe_lru::KIND_UP];
+        gate_exps = upd[llama_moe_lru::KIND_GATE];
+        down_exps = upd[llama_moe_lru::KIND_DOWN];
+        selected_experts = slot;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
