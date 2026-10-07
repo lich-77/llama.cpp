@@ -463,18 +463,14 @@ llama_context::llama_context(
         }
 
         if (model.moe_lru_slots() > 0) {
-            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-                LLAMA_LOG_WARN("llama_moe_lru: -sm tensor is not supported yet, running without pools\n");
-            } else {
-                std::vector<ggml_backend_t> lru_backends;
-                for (const auto & b : backends) {
-                    ggml_backend_dev_t d = ggml_backend_get_device(b.get());
-                    if (d && llama_moe_lru::backend_supports(d)) {
-                        lru_backends.push_back(b.get());
-                    }
+            std::vector<ggml_backend_t> lru_backends;
+            for (const auto & b : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                if (d && llama_moe_lru::backend_supports(d)) {
+                    lru_backends.push_back(b.get());
                 }
-                lru = model.create_moe_lru(lru_backends);
             }
+            lru = model.create_moe_lru(lru_backends);
         }
 
         sched_reserve();

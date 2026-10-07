@@ -1382,12 +1382,12 @@ static __global__ void k_lru_decide(
 static __global__ void k_lru_fill(
         const int32_t * __restrict__ fill_list, int n_slot,
         const char * __restrict__ src, char * __restrict__ pool,
-        size_t estride, size_t sstride, size_t bytes) {
+        size_t estride, size_t sstride, size_t bytes, size_t src_col_off) {
     const int j = blockIdx.y;
     if (j >= fill_list[2 * n_slot]) return;
     const int32_t e = fill_list[2 * j + 0];
     const int32_t s = fill_list[2 * j + 1];
-    const char * src_e = src + (size_t) e * estride;
+    const char * src_e = src + (size_t) e * estride + src_col_off;
     char * dst = pool + (size_t) s * sstride;
     const size_t n16 = bytes / 16;
     const uint4 * s4 = (const uint4 *) src_e;
@@ -1399,6 +1399,27 @@ static __global__ void k_lru_fill(
     for (size_t i = n16 * 16 + blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < bytes;
          i += (size_t) gridDim.x * blockDim.x) {
         dst[i] = src_e[i];
+    }
+}
+
+// split along ne[0]: every local row is a column slice of a source row
+static __global__ void k_lru_fill_col(
+        const int32_t * __restrict__ fill_list, int n_slot,
+        const char * __restrict__ src, char * __restrict__ pool,
+        size_t estride, size_t sstride,
+        size_t seg_bytes, size_t n_rows, size_t src_row_stride, size_t src_col_off) {
+    const int j = blockIdx.y;
+    if (j >= fill_list[2 * n_slot]) return;
+    const int32_t e = fill_list[2 * j + 0];
+    const int32_t s = fill_list[2 * j + 1];
+    const char * src_e = src + (size_t) e * estride + src_col_off;
+    char * dst_e = pool + (size_t) s * sstride;
+    const size_t total = n_rows * seg_bytes;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total;
+         i += (size_t) gridDim.x * blockDim.x) {
+        const size_t row = i / seg_bytes;
+        const size_t b = i % seg_bytes;
+        dst_e[row * seg_bytes + b] = src_e[row * src_row_stride + b];
     }
 }
 
@@ -2094,10 +2115,34 @@ static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(src->nb[2] % 16 == 0);
     const dim3 grid(64, n_rows < 1 ? 1 : n_rows), block(256);
 
-    k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
-        (const int32_t *) fill_list->data, n_rows,
-        (const char *) src->data, (char *) pool->data,
-        src->nb[2], pool->nb[2], pool->nb[2]);
+    // under a device split this dispatch runs once per device with a pool
+    // view of that device's slice, so the source offset needs the device index
+    if (pool->nb[1] != src->nb[1]) {
+        // columnar: local rows are column slices of the source rows (ne[0] split)
+        int dev = 0;
+        cudaGetDevice(&dev);
+        k_lru_fill_col<<<grid, block, 0, ctx.stream()>>>(
+            (const int32_t *) fill_list->data, n_rows,
+            (const char *) src->data, (char *) pool->data,
+            src->nb[2], pool->nb[2],
+            pool->nb[1], pool->ne[1], src->nb[1], (size_t) dev * pool->nb[1]);
+    } else if (pool->ne[1] != src->ne[1]) {
+        // row split: local rows are whole source rows, this device holds a
+        // slice of the row set (ne[1] split)
+        int dev = 0;
+        cudaGetDevice(&dev);
+        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
+            (const int32_t *) fill_list->data, n_rows,
+            (const char *) src->data, (char *) pool->data,
+            src->nb[2], pool->nb[2], pool->nb[2],
+            (size_t) dev * pool->ne[1] * pool->nb[1]);
+    } else {
+        // whole pool: single device or layer split, no source offset
+        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
+            (const int32_t *) fill_list->data, n_rows,
+            (const char *) src->data, (char *) pool->data,
+            src->nb[2], pool->nb[2], pool->nb[2], 0);
+    }
 
 }
 

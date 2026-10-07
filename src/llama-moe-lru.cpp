@@ -62,7 +62,7 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
 
 bool llama_moe_lru::backend_supports(ggml_backend_dev_t dev) {
     // capability probe: excludes GPU backends without LRU kernels
-    // (e.g. Vulkan)
+    // (e.g. Vulkan); meta devices pass by forwarding to their children
     ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
     ggml_context_ptr ctx(ggml_init(ip));
     if (!ctx) {
@@ -110,11 +110,13 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             if (!up->data) {
                 throw std::runtime_error("llama_moe_lru: expert weights not mapped");
             }
+            // pageable host memory hangs the fill kernel
             if (ggml_backend_buffer_get_type(up->buffer) != host_buft) {
                 throw std::runtime_error("llama_moe_lru: expert weights are host but not pinned "
                                          "(use --n-cpu-moe or -ot with --moe-lru-slots and a non-lazy load mode)");
             }
             pooled_ids.push_back(il);
+            // pool locality = layer locality: follow the router weight's device
             ggml_backend_dev_t cdev = nullptr;
             const ggml_tensor * gate_inp = model.layers[il].ffn_gate_inp;
             if (gate_inp && gate_inp->buffer) {
@@ -134,6 +136,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     this->n_slot = n_slot;
     this->n_expert = n_expert;
 
+    // model layer -> pool index; the pooled set may be any subset (-ot)
     layer_to_pool.assign(n_layer_tot, -1);
     for (int li = 0; li < this->n_layers; li++) {
         layer_to_pool[pooled_ids[li]] = li;
@@ -159,14 +162,21 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             L.exps[k] = exps[k];
         }
 
+        // standard allocator: correct data pointers and init for meta
+        // buffer types; names must be set before alloc, the meta split
+        // callback classifies tensors by name
+        static const char * kind_name[N_KIND] = { "gate", "up", "down" };
         ggml_context_ptr pctx(ggml_init({ (N_KIND + 2) * ggml_tensor_overhead(), nullptr, true }));
         for (int k = 0; k < N_KIND; k++) {
             ggml_tensor * t = ggml_new_tensor_3d(pctx.get(), exps[k]->type,
                                                  exps[k]->ne[0], exps[k]->ne[1], n_slot);
+            ggml_format_name(t, "blk.%d.moe_lru_pool.%s", il, kind_name[k]);
             L.pool[k] = t;
         }
+        // +tick +cum_ids +cum_fills
         L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
                                      n_expert + 2 * (int64_t) n_slot + 3);
+        ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
         if (!b) {
@@ -175,11 +185,13 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         bufs.emplace_back(b);
         pool_ctxs.emplace_back(std::move(pctx));
 
-        // owner = -1, slot owner = -1, last_use = 0, tick = 1
+        // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
         const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3;
         std::vector<int32_t> h(n_state, -1);
         for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = 0;
-        h[n_expert + 2 * n_slot] = 1;
+        h[n_expert + 2 * n_slot] = 1;      // tick
+        h[n_expert + 2 * n_slot + 1] = 0;  // cum_ids
+        h[n_expert + 2 * n_slot + 2] = 0;  // cum_fills
         ggml_backend_tensor_set(L.state, h.data(), 0, h.size() * 4);
     }
 
@@ -197,6 +209,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
 void llama_moe_lru::log_final_stats() {
     int64_t total_ids = 0, total_fills = 0;
 
+    // pool index -> model layer number, for the per-layer log lines
     std::vector<int> pool_to_layer(n_layers);
     for (int il = 0; il < (int) layer_to_pool.size(); il++) {
         if (layer_to_pool[il] >= 0) {
