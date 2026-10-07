@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-lru.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -299,6 +300,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // LRU expert pool runtime, active only when --moe-lru-slots is set
+    std::unique_ptr<llama_moe_lru> lru;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

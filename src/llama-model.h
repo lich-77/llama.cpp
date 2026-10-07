@@ -617,6 +617,8 @@ struct llama_device {
     ggml_backend_dev_t dev;
 };
 
+struct llama_moe_lru;
+
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
@@ -770,6 +772,8 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    int32_t moe_lru_slots() const;
+    std::unique_ptr<llama_moe_lru> create_moe_lru(const std::vector<ggml_backend_t> & gpu_backends) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

@@ -1329,6 +1329,79 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
 /// kernels
 
+// single-thread kernel: the state update must be deterministic for CUDA
+// graph replay. ids may be a strided view (nb[1] != n_used*4), so every read
+// goes through the row stride
+static __global__ void k_lru_decide(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ slot_ids,
+        int32_t * __restrict__ state, int32_t * __restrict__ fill_list,
+        int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride) {
+    int32_t * owner    = state;                     // expert -> slot
+    int32_t * slot_of  = state + n_expert;          // slot -> expert
+    int32_t * last_use = state + n_expert + n_slot; // tick of the last use per slot
+    const int32_t t0   = state[n_expert + 2 * n_slot];
+    const int n_total = n_used * n_tokens;
+
+    int n_fill = 0;
+    for (int i = 0; i < n_total; i++) {
+        const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
+        if (e < 0 || e >= n_expert) continue;
+        const int32_t s = owner[e];
+        slot_ids[i] = s;
+        if (s >= 0) last_use[s] = t0;
+    }
+    for (int i = 0; i < n_total; i++) {
+        if (slot_ids[i] >= 0) continue;
+        const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
+        if (e < 0 || e >= n_expert) continue;
+        if (owner[e] >= 0) {
+            slot_ids[i] = owner[e];
+            continue;
+        }
+        int best = 0;
+        for (int s = 1; s < n_slot; s++) {
+            if (last_use[s] < last_use[best]) best = s;
+        }
+        const int32_t prev = slot_of[best];
+        if (prev >= 0) owner[prev] = -1;
+        slot_of[best] = e;
+        owner[e] = best;
+        last_use[best] = t0;
+        slot_ids[i] = best;
+        fill_list[2 * n_fill + 0] = e;
+        fill_list[2 * n_fill + 1] = best;
+        n_fill++;
+    }
+    state[n_expert + 2 * n_slot] = t0 + 1;
+    state[n_expert + 2 * n_slot + 1] += n_total;
+    state[n_expert + 2 * n_slot + 2] += n_fill;
+    fill_list[2 * n_slot] = n_fill;
+}
+
+
+static __global__ void k_lru_fill(
+        const int32_t * __restrict__ fill_list, int n_slot,
+        const char * __restrict__ src, char * __restrict__ pool,
+        size_t estride, size_t sstride, size_t bytes) {
+    const int j = blockIdx.y;
+    if (j >= fill_list[2 * n_slot]) return;
+    const int32_t e = fill_list[2 * j + 0];
+    const int32_t s = fill_list[2 * j + 1];
+    const char * src_e = src + (size_t) e * estride;
+    char * dst = pool + (size_t) s * sstride;
+    const size_t n16 = bytes / 16;
+    const uint4 * s4 = (const uint4 *) src_e;
+    uint4 * d4 = (uint4 *) dst;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n16;
+         i += (size_t) gridDim.x * blockDim.x) {
+        d4[i] = s4[i];
+    }
+    for (size_t i = n16 * 16 + blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < bytes;
+         i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = src_e[i];
+    }
+}
+
 typedef void (*ggml_cuda_op_mul_mat_t)(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1989,6 +2062,45 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids  = dst->src[0];
+    ggml_tensor * state      = dst->src[1];
+
+    const int n_expert = ggml_get_op_params_i32(dst, 0);
+    const int n_slot   = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+    const int ids_stride = (int) (ids->nb[1] / ggml_type_size(ids->type));
+
+    const int n_used   = (int) ids->ne[0];
+    const int n_tokens = (int) ids->ne[1];
+    int32_t * fill_list = (int32_t *) dst->data + (size_t) n_used * n_tokens;
+
+    k_lru_decide<<<1, 1, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, (int32_t *) dst->data,
+        (int32_t *) state->data, fill_list,
+        n_used, n_tokens, n_expert, n_slot, ids_stride);
+}
+
+static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * fill_list = dst->src[0];
+    ggml_tensor * pool            = dst->src[1];
+
+    ggml_tensor * src;
+    memcpy(&src, dst->op_params, sizeof(src));
+
+    const int n_rows = (int) ((fill_list->ne[0] - 1) / 2);
+    GGML_ASSERT(pool->nb[2] % 16 == 0);
+    GGML_ASSERT(src->nb[2] % 16 == 0);
+    const dim3 grid(64, n_rows < 1 ? 1 : n_rows), block(256);
+
+    k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
+        (const int32_t *) fill_list->data, n_rows,
+        (const char *) src->data, (char *) pool->data,
+        src->nb[2], pool->nb[2], pool->nb[2]);
+
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2272,6 +2384,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 default:
                     return false;
             }
+            break;
+        case GGML_OP_LRU_DECIDE:
+            ggml_cuda_lru_decide(ctx, dst);
+            break;
+        case GGML_OP_LRU_FILL:
+            ggml_cuda_lru_fill(ctx, dst);
             break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
@@ -5321,6 +5439,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_LRU_DECIDE:
+        case GGML_OP_LRU_FILL:
+            return true;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
